@@ -1,0 +1,90 @@
+#!/bin/bash
+#
+# $0 <duplicity_restore_url> <image_fn_to_create.img>
+#
+# Example: $0 file:///home/mjuric/backups/trac/2000/2010/2012/2012-12/2012-12-02 dev.lsstcorp.org.restored.img
+#
+
+test $# == 2 || { echo "Usage: $0 <duplicity_restore_url> <image_fn_to_create.img>"; exit -1; }
+test -f "$2" && { echo "$2 exists; cowardly refusing to proceed."; exit -1; }
+
+SRC="$1"	# url of the backup to restore
+IMG="$2"	# new image to create
+
+vda=(236223201280)						# disk size (bytes)
+vda1=(2048 1026047 06aea622-13a0-4d87-8f44-e7a7e74f6ade)	# partition boundaries (cylinders), uuid
+vda2=(1026048 461371007)					# partition boundaries (cylinders)
+lv_root=(110088 16e06a8a-de19-4b49-826f-999c59532cc9)		# logical volume size (bytes), uuid
+lv_swap=(  2048 a4c59362-abac-4036-b78f-2150eef017af)		# logical volume size (bytes), uuid
+
+set -e
+set -x
+
+# create a temporary mount point
+MNT=$(mktemp --tmpdir -d XXXXXXXX.imgrestore)
+
+# Creating the disk image
+qemu-img create -f raw "$IMG" ${vda[0]}B
+guestfish -a "$IMG" <<-EOF
+	run
+
+	part-init /dev/vda msdos
+	part-add /dev/vda p ${vda1[0]} ${vda1[1]}
+	part-add /dev/vda p ${vda2[0]} ${vda2[1]}
+	part-set-bootable /dev/vda 1 yes
+
+	pvcreate /dev/vda2
+	vgcreate vg_dev /dev/vda2
+	lvcreate lv_root vg_dev ${lv_root[0]}
+	lvcreate lv_swap vg_dev ${lv_swap[0]}
+
+	mkfs ext4 /dev/vda1
+	mkfs ext4 /dev/vg_dev/lv_root
+
+	mkswap-U ${lv_swap[1]} /dev/vg_dev/lv_swap
+
+	set-e2uuid /dev/vda1 ${vda1[2]}
+	set-e2uuid /dev/vg_dev/lv_root ${lv_root[1]}
+EOF
+
+#
+# extract the backup into the image
+#
+kpartx -a "$IMG"
+lvchange -ay /dev/vg_dev/lv_root
+
+mkdir -p "$MNT"
+mount /dev/vg_dev/lv_root "$MNT"
+mkdir -p "$MNT"/boot
+mount /dev/mapper/loop0p1 "$MNT"/boot
+
+duplicity restore "$SRC" "$MNT" --no-encryption --numeric-owner --force
+(cd "$MNT" && .dupext/restore-hard-links)
+(cd "$MNT" && .dupext/restore-acl)
+touch "$MNT"/.autorelabel
+
+umount "$MNT"/boot
+umount "$MNT"
+rmdir "$MNT"
+
+lvchange -an /dev/vg_dev/lv_root
+kpartx -d "$IMG"
+
+#
+# install grub, restore context
+#
+guestfish --selinux -a "$IMG" <<-EOF
+	run
+	mount /dev/vg_dev/lv_root /
+	mount /dev/vda1 /boot
+	sh "load_policy"
+	sh "restorecon -R /"
+	sh "/.dupext/restore-attr"
+	sh "grub-install /dev/vda"
+EOF
+
+# run
+#virsh start dev_restored --console
+
+# sparsify
+#virt-sparsify "$IMG" --convert qcow2 sparsified.img
